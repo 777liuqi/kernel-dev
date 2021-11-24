@@ -120,9 +120,8 @@ static inline unsigned int fq_ring_add(struct iova_fq *fq)
 	return idx;
 }
 
-static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
+static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq, u64 counter)
 {
-	u64 counter = atomic64_read(&cookie->fq_flush_finish_cnt);
 	unsigned int idx;
 
 	assert_spin_locked(&fq->lock);
@@ -141,20 +140,21 @@ static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
 	}
 }
 
-static void fq_flush_iotlb(struct iommu_dma_cookie *cookie)
+static u64 fq_flush_iotlb(struct iommu_dma_cookie *cookie)
 {
 	atomic64_inc(&cookie->fq_flush_start_cnt);
 	cookie->fq_domain->ops->flush_iotlb_all(cookie->fq_domain);
-	atomic64_inc(&cookie->fq_flush_finish_cnt);
+	return atomic64_inc_return(&cookie->fq_flush_finish_cnt);
 }
 
 static void fq_flush_timeout(struct timer_list *t)
 {
 	struct iommu_dma_cookie *cookie = from_timer(cookie, t, fq_timer);
 	int cpu;
+	u64 counter;
 
 	atomic_set(&cookie->fq_timer_on, 0);
-	fq_flush_iotlb(cookie);
+	counter = fq_flush_iotlb(cookie);
 
 	for_each_possible_cpu(cpu) {
 		unsigned long flags;
@@ -162,7 +162,7 @@ static void fq_flush_timeout(struct timer_list *t)
 
 		fq = per_cpu_ptr(cookie->fq, cpu);
 		spin_lock_irqsave(&fq->lock, flags);
-		fq_ring_free(cookie, fq);
+		fq_ring_free(cookie, fq, counter);
 		spin_unlock_irqrestore(&fq->lock, flags);
 	}
 }
@@ -192,11 +192,11 @@ static void queue_iova(struct iommu_dma_cookie *cookie,
 	 * flushed out on another CPU. This makes the fq_full() check below less
 	 * likely to be true.
 	 */
-	fq_ring_free(cookie, fq);
+	fq_ring_free(cookie, fq, atomic64_read(&cookie->fq_flush_finish_cnt));
 
 	if (fq_full(fq)) {
-		fq_flush_iotlb(cookie);
-		fq_ring_free(cookie, fq);
+		u64 counter = fq_flush_iotlb(cookie);
+		fq_ring_free(cookie, fq, counter);
 	}
 
 	idx = fq_ring_add(fq);
